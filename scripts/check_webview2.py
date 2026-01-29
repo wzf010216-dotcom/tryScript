@@ -19,16 +19,29 @@ def get_latest_fixed_version():
     with urllib.request.urlopen(EDGE_PRODUCTS_API) as resp:
         data = json.load(resp)
 
-    for product in data:
-        if product.get("Product") == "WebView2":
-            for release in product.get("Releases", []):
-                if release.get("Channel") == "Stable":
-                    version = release.get("ProductVersion")
-                    if not re.match(r"^\d+\.\d+\.\d+\.\d+$", version):
-                        raise RuntimeError(f"非法版本号: {version}")
-                    return version
+    versions = set()
 
-    raise RuntimeError("未找到 WebView2 Stable")
+    for product in data:
+        if product.get("Product") == "WebView2 Runtime":
+            for release in product.get("Releases", []):
+                if release.get("Platform") != "Windows":
+                    continue
+
+                for artifact in release.get("Artifacts", []):
+                    if artifact.get("ArtifactName") == "webview2-fixed":
+                        version = artifact.get("Version")
+                        if version and re.match(r"^\d+\.\d+\.\d+\.\d+$", version):
+                            versions.add(version)
+
+    if not versions:
+        raise RuntimeError("未找到 WebView2 Fixed Version")
+
+    # 取最高版本
+    return sorted(
+        versions,
+        key=lambda v: [int(x) for x in v.split(".")]
+    )[-1]
+
 
 
 def head_check(url):
