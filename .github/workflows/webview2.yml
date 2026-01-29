@@ -1,0 +1,52 @@
+name: WebView2 Auto Archive
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * 1"   # 每周一 UTC 01:00
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run script
+        run: python scripts/check_webview2.py
+
+      - name: Check if update happened
+        id: check
+        run: |
+          if git diff --quiet latest_version.txt; then
+            echo "updated=false" >> $GITHUB_OUTPUT
+          else
+            echo "updated=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit version file
+        if: steps.check.outputs.updated == 'true'
+        run: |
+          git config user.name github-actions
+          git config user.email github-actions@github.com
+          git add latest_version.txt
+          git commit -m "chore: update WebView2 version"
+          git push
+
+      - name: Create Release
+        if: steps.check.outputs.updated == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: WebView2 Fixed ${{ env.VERSION }}
+          files: dist/*
+        env:
+          VERSION: ${{ steps.check.outputs.updated && hashFiles('latest_version.txt') }}
