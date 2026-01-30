@@ -10,8 +10,14 @@ EDGE_PRODUCTS_API = "https://edgeupdates.microsoft.com/api/products"
 
 ARCHES = ["x86", "x64", "arm64"]
 
-FIXED_ARTIFACT = "webview2-fixed-version-description"
-EVERGREEN_ARTIFACT = "evergreen-installer-description"
+FIXED_REGEX = re.compile(
+    r"fixedversionruntime\.(\d+\.\d+\.\d+\.\d+)\.(x86|x64|arm64)\.cab$",
+    re.IGNORECASE,
+)
+EVERGREEN_REGEX = re.compile(
+    r"webview2runtimeinstaller(arm64|x64|x86)\.exe$",
+    re.IGNORECASE,
+)
 
 
 def parse_version(value):
@@ -23,6 +29,15 @@ def parse_version(value):
 
 def version_key(value):
     return [int(x) for x in value.split(".")]
+
+
+def normalize_arch(value):
+    if not value:
+        return None
+    value = value.lower()
+    if value in ARCHES:
+        return value
+    return None
 
 
 def get_latest_tag_version():
@@ -49,7 +64,8 @@ def get_latest_release_artifacts():
     evergreen = {}
 
     for product in data:
-        if product.get("Product") != "WebView2 Runtime":
+        product_name = (product.get("Product") or "").lower()
+        if "webview2" not in product_name:
             continue
 
         for release in product.get("Releases", []):
@@ -61,33 +77,34 @@ def get_latest_release_artifacts():
             if channel and channel != "Stable":
                 continue
 
-            release_arch = (release.get("Architecture") or release.get("Arch") or "").lower()
+            release_arch = normalize_arch(release.get("Architecture") or release.get("Arch"))
             release_version = (
                 parse_version(release.get("ProductVersion"))
                 or parse_version(release.get("Version"))
             )
 
             for artifact in release.get("Artifacts", []):
-                name = (artifact.get("ArtifactName") or "").lower()
-                if not name:
-                    continue
-
-                if FIXED_ARTIFACT not in name and EVERGREEN_ARTIFACT not in name:
-                    continue
-
-                version = parse_version(artifact.get("Version")) or release_version
-                arch = release_arch or (artifact.get("Architecture") or "").lower()
                 location = artifact.get("Location")
-
-                if not version or not arch or not location:
-                    continue
-                if arch not in ARCHES:
+                if not location:
                     continue
 
-                if FIXED_ARTIFACT in name:
-                    fixed.setdefault(version, {})[arch] = location
-                elif EVERGREEN_ARTIFACT in name:
-                    evergreen.setdefault(version, {})[arch] = location
+                filename = filename_from_url(location)
+
+                fixed_match = FIXED_REGEX.search(filename)
+                if fixed_match:
+                    version = fixed_match.group(1)
+                    arch = normalize_arch(fixed_match.group(2))
+                    if version and arch:
+                        fixed.setdefault(version, {})[arch] = location
+                    continue
+
+                evergreen_match = EVERGREEN_REGEX.search(filename)
+                if evergreen_match:
+                    arch = normalize_arch(evergreen_match.group(1)) or release_arch
+                    version = parse_version(artifact.get("Version")) or release_version
+                    if version and arch:
+                        evergreen.setdefault(version, {})[arch] = location
+                    continue
 
     if not fixed:
         raise RuntimeError("No fixed version artifacts found from edgeupdates API")
