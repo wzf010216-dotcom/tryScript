@@ -5,11 +5,13 @@ import urllib.request
 import hashlib
 import subprocess
 import html as html_lib
+import json
 
 WEBVIEW2_DOWNLOAD_PAGES = [
     "https://developer.microsoft.com/microsoft-edge/webview2",
     "https://developer.microsoft.com/en-us/microsoft-edge/webview2",
 ]
+WEBVIEW2_API = "https://developer.microsoft.com/microsoft-edge/api/webview2"
 WEBVIEW2_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -86,15 +88,16 @@ def extract_fixed_urls(html):
 
 
 def get_latest_release_artifacts():
-    fixed = {}
-    for page in WEBVIEW2_DOWNLOAD_PAGES:
-        html = fetch_text(page)
-        fixed = extract_fixed_urls(html)
-        if fixed:
-            break
+    fixed = get_fixed_from_api()
+    if not fixed:
+        for page in WEBVIEW2_DOWNLOAD_PAGES:
+            html = fetch_text(page)
+            fixed = extract_fixed_urls(html)
+            if fixed:
+                break
 
     if not fixed:
-        raise RuntimeError("No fixed version artifacts found on WebView2 download page")
+        raise RuntimeError("No fixed version artifacts found from WebView2 API or download page")
 
     candidates = [
         version
@@ -107,6 +110,27 @@ def get_latest_release_artifacts():
 
     latest = sorted(candidates, key=version_key)[-1]
     return latest, fixed[latest], EVERGREEN_FWLINKS.copy()
+
+
+def get_fixed_from_api():
+    try:
+        text = fetch_text(WEBVIEW2_API)
+        data = json.loads(text)
+    except Exception:
+        return {}
+
+    fixed = {}
+    for entry in data or []:
+        version = entry.get("version")
+        if not version:
+            continue
+        for build in entry.get("builds", []):
+            arch = normalize_arch(build.get("architecture"))
+            url = build.get("url")
+            if not (arch and url):
+                continue
+            fixed.setdefault(version, {})[arch] = url
+    return fixed
 
 
 def resolve_url(url):
@@ -162,7 +186,7 @@ def filename_from_url(url):
 def default_headers():
     return {
         "User-Agent": WEBVIEW2_USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept-Encoding": "identity",
     }
