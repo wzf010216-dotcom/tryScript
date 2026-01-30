@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import urllib.parse
@@ -6,7 +5,7 @@ import urllib.request
 import hashlib
 import subprocess
 
-EDGE_PRODUCTS_API = "https://edgeupdates.microsoft.com/api/products"
+WEBVIEW2_DOWNLOAD_PAGE = "https://developer.microsoft.com/microsoft-edge/webview2"
 
 ARCHES = ["x86", "x64", "arm64"]
 
@@ -14,17 +13,11 @@ FIXED_REGEX = re.compile(
     r"fixedversionruntime\.(\d+\.\d+\.\d+\.\d+)\.(x86|x64|arm64)\.cab$",
     re.IGNORECASE,
 )
-EVERGREEN_REGEX = re.compile(
-    r"webview2runtimeinstaller(arm64|x64|x86)\.exe$",
-    re.IGNORECASE,
-)
-
-
-def parse_version(value):
-    if not value:
-        return None
-    match = re.search(r"\d+\.\d+\.\d+\.\d+", str(value))
-    return match.group(0) if match else None
+EVERGREEN_FWLINKS = {
+    "x86": "https://go.microsoft.com/fwlink/?linkid=2099617",
+    "x64": "https://go.microsoft.com/fwlink/?linkid=2124701",
+    "arm64": "https://go.microsoft.com/fwlink/?linkid=2099616",
+}
 
 
 def version_key(value):
@@ -56,81 +49,56 @@ def get_latest_tag_version():
     return None
 
 
-def get_latest_release_artifacts():
-    with urllib.request.urlopen(EDGE_PRODUCTS_API) as resp:
-        data = json.load(resp)
-
+def extract_fixed_urls(html):
     fixed = {}
-    evergreen = {}
-
-    for product in data:
-        product_name = (product.get("Product") or "").lower()
-        if "webview2" not in product_name:
+    for match in re.findall(r"https?://[^\"'\\s<>]+", html):
+        url = match.rstrip("\\")
+        filename = filename_from_url(url)
+        fixed_match = FIXED_REGEX.search(filename)
+        if not fixed_match:
             continue
+        version = fixed_match.group(1)
+        arch = normalize_arch(fixed_match.group(2))
+        if version and arch:
+            fixed.setdefault(version, {})[arch] = url
+    return fixed
 
-        for release in product.get("Releases", []):
-            platform = release.get("Platform")
-            if platform and platform != "Windows":
-                continue
 
-            channel = release.get("Channel")
-            if channel and channel != "Stable":
-                continue
+def get_latest_release_artifacts():
+    with urllib.request.urlopen(WEBVIEW2_DOWNLOAD_PAGE) as resp:
+        html = resp.read().decode("utf-8", errors="ignore")
 
-            release_arch = normalize_arch(release.get("Architecture") or release.get("Arch"))
-            release_version = (
-                parse_version(release.get("ProductVersion"))
-                or parse_version(release.get("Version"))
-            )
-
-            for artifact in release.get("Artifacts", []):
-                location = artifact.get("Location")
-                if not location:
-                    continue
-
-                filename = filename_from_url(location)
-
-                fixed_match = FIXED_REGEX.search(filename)
-                if fixed_match:
-                    version = fixed_match.group(1)
-                    arch = normalize_arch(fixed_match.group(2))
-                    if version and arch:
-                        fixed.setdefault(version, {})[arch] = location
-                    continue
-
-                evergreen_match = EVERGREEN_REGEX.search(filename)
-                if evergreen_match:
-                    arch = normalize_arch(evergreen_match.group(1)) or release_arch
-                    version = parse_version(artifact.get("Version")) or release_version
-                    if version and arch:
-                        evergreen.setdefault(version, {})[arch] = location
-                    continue
+    fixed = extract_fixed_urls(html)
 
     if not fixed:
-        raise RuntimeError("No fixed version artifacts found from edgeupdates API")
+        raise RuntimeError("No fixed version artifacts found on WebView2 download page")
 
     candidates = [
         version
         for version in fixed
         if all(arch in fixed.get(version, {}) for arch in ARCHES)
-        and all(arch in evergreen.get(version, {}) for arch in ARCHES)
     ]
 
     if not candidates:
-        raise RuntimeError("No release has complete fixed + evergreen artifacts for all arches")
+        raise RuntimeError("No fixed version has artifacts for all arches")
 
     latest = sorted(candidates, key=version_key)[-1]
-    return latest, fixed[latest], evergreen[latest]
+    return latest, fixed[latest], EVERGREEN_FWLINKS.copy()
 
 
-def head_check(url):
-    req = urllib.request.Request(url, method="HEAD")
-    urllib.request.urlopen(req)
+def resolve_url(url):
+    try:
+        req = urllib.request.Request(url, method="HEAD")
+        with urllib.request.urlopen(req) as resp:
+            return resp.geturl(), resp.headers.get("Content-Disposition")
+    except Exception:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req) as resp:
+            return resp.geturl(), resp.headers.get("Content-Disposition")
 
 
 def download(url, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    head_check(url)
     print(f"Downloading {path}")
     urllib.request.urlretrieve(url, path)
 
@@ -149,6 +117,17 @@ def set_output(name, value):
         return
     with open(output_path, "a", encoding="utf-8") as f:
         f.write(f"{name}={value}\n")
+
+
+def filename_from_headers(url, content_disposition):
+    if content_disposition:
+        match = re.search(r"filename\\*=UTF-8''([^;]+)", content_disposition)
+        if match:
+            return os.path.basename(urllib.parse.unquote(match.group(1)))
+        match = re.search(r'filename=\"?([^\";]+)\"?', content_disposition)
+        if match:
+            return os.path.basename(match.group(1))
+    return filename_from_url(url)
 
 
 def filename_from_url(url):
@@ -173,20 +152,22 @@ def main():
 
     checksums = []
 
-    # Fixed Version (from edgeupdates artifacts)
+    # Fixed Version (from WebView2 download page)
     for arch in ARCHES:
         url = fixed_urls[arch]
-        filename = filename_from_url(url)
+        final_url, content_disposition = resolve_url(url)
+        filename = filename_from_headers(final_url, content_disposition)
         path = os.path.join("dist", filename)
-        download(url, path)
+        download(final_url, path)
         checksums.append((os.path.basename(path), sha256(path)))
 
-    # Evergreen Installer (from edgeupdates artifacts)
+    # Evergreen Installer (from WebView2 fwlinks)
     for arch in ARCHES:
         url = evergreen_urls[arch]
-        filename = filename_from_url(url)
+        final_url, content_disposition = resolve_url(url)
+        filename = filename_from_headers(final_url, content_disposition)
         path = os.path.join("dist", filename)
-        download(url, path)
+        download(final_url, path)
         checksums.append((os.path.basename(path), sha256(path)))
 
     with open("dist/SHA256SUMS.txt", "w", encoding="utf-8") as f:
