@@ -33,3 +33,4 @@ jobs:
           tag_name: v${{ steps.check.outputs.version }}
           name: WebView2 Fixed ${{ steps.check.outputs.version }}
           files: dist/*
+          fail_on_unmatched_files: true
