@@ -1,47 +1,109 @@
 import json
 import os
 import re
+import urllib.parse
 import urllib.request
 import hashlib
+import subprocess
 
 EDGE_PRODUCTS_API = "https://edgeupdates.microsoft.com/api/products"
 
 ARCHES = ["x86", "x64", "arm64"]
 
-EVERGREEN_MSI = {
-    "x86": "https://go.microsoft.com/fwlink/?linkid=2124707",
-    "x64": "https://go.microsoft.com/fwlink/?linkid=2124708",
-    "arm64": "https://go.microsoft.com/fwlink/?linkid=2124709",
-}
+FIXED_ARTIFACT = "webview2-fixed-version-description"
+EVERGREEN_ARTIFACT = "evergreen-installer-description"
 
 
-def get_latest_fixed_version():
+def parse_version(value):
+    if not value:
+        return None
+    match = re.search(r"\d+\.\d+\.\d+\.\d+", str(value))
+    return match.group(0) if match else None
+
+
+def version_key(value):
+    return [int(x) for x in value.split(".")]
+
+
+def get_latest_tag_version():
+    try:
+        output = subprocess.check_output(
+            ["git", "tag", "--list", "v*", "--sort=-version:refname"],
+            text=True,
+        )
+    except Exception:
+        return None
+
+    for line in output.splitlines():
+        match = re.match(r"^v(\d+\.\d+\.\d+\.\d+)$", line.strip())
+        if match:
+            return match.group(1)
+    return None
+
+
+def get_latest_release_artifacts():
     with urllib.request.urlopen(EDGE_PRODUCTS_API) as resp:
         data = json.load(resp)
 
-    versions = set()
+    fixed = {}
+    evergreen = {}
 
     for product in data:
-        if product.get("Product") == "WebView2 Runtime":
-            for release in product.get("Releases", []):
-                if release.get("Platform") != "Windows":
+        if product.get("Product") != "WebView2 Runtime":
+            continue
+
+        for release in product.get("Releases", []):
+            platform = release.get("Platform")
+            if platform and platform != "Windows":
+                continue
+
+            channel = release.get("Channel")
+            if channel and channel != "Stable":
+                continue
+
+            release_arch = (release.get("Architecture") or release.get("Arch") or "").lower()
+            release_version = (
+                parse_version(release.get("ProductVersion"))
+                or parse_version(release.get("Version"))
+            )
+
+            for artifact in release.get("Artifacts", []):
+                name = (artifact.get("ArtifactName") or "").lower()
+                if not name:
                     continue
 
-                for artifact in release.get("Artifacts", []):
-                    if artifact.get("ArtifactName") == "webview2-fixed":
-                        version = artifact.get("Version")
-                        if version and re.match(r"^\d+\.\d+\.\d+\.\d+$", version):
-                            versions.add(version)
+                if FIXED_ARTIFACT not in name and EVERGREEN_ARTIFACT not in name:
+                    continue
 
-    if not versions:
-        raise RuntimeError("未找到 WebView2 Fixed Version")
+                version = parse_version(artifact.get("Version")) or release_version
+                arch = release_arch or (artifact.get("Architecture") or "").lower()
+                location = artifact.get("Location")
 
-    # 取最高版本
-    return sorted(
-        versions,
-        key=lambda v: [int(x) for x in v.split(".")]
-    )[-1]
+                if not version or not arch or not location:
+                    continue
+                if arch not in ARCHES:
+                    continue
 
+                if FIXED_ARTIFACT in name:
+                    fixed.setdefault(version, {})[arch] = location
+                elif EVERGREEN_ARTIFACT in name:
+                    evergreen.setdefault(version, {})[arch] = location
+
+    if not fixed:
+        raise RuntimeError("No fixed version artifacts found from edgeupdates API")
+
+    candidates = [
+        version
+        for version in fixed
+        if all(arch in fixed.get(version, {}) for arch in ARCHES)
+        and all(arch in evergreen.get(version, {}) for arch in ARCHES)
+    ]
+
+    if not candidates:
+        raise RuntimeError("No release has complete fixed + evergreen artifacts for all arches")
+
+    latest = sorted(candidates, key=version_key)[-1]
+    return latest, fixed[latest], evergreen[latest]
 
 
 def head_check(url):
@@ -52,7 +114,7 @@ def head_check(url):
 def download(url, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     head_check(url)
-    print(f"下载 {path}")
+    print(f"Downloading {path}")
     urllib.request.urlretrieve(url, path)
 
 
@@ -64,45 +126,57 @@ def sha256(path):
     return h.hexdigest()
 
 
+def set_output(name, value):
+    output_path = os.environ.get("GITHUB_OUTPUT")
+    if not output_path:
+        return
+    with open(output_path, "a", encoding="utf-8") as f:
+        f.write(f"{name}={value}\n")
+
+
+def filename_from_url(url):
+    parsed = urllib.parse.urlparse(url)
+    base = os.path.basename(parsed.path)
+    return base or "download.bin"
+
+
 def main():
-    latest = get_latest_fixed_version()
-    print(f"最新版本: {latest}")
+    latest, fixed_urls, evergreen_urls = get_latest_release_artifacts()
+    print(f"Latest WebView2 fixed version: {latest}")
 
-    current = None
-    if os.path.exists("latest_version.txt"):
-        current = open("latest_version.txt").read().strip()
+    current_tag = get_latest_tag_version()
+    print(f"Latest git tag version: {current_tag}")
 
-    print(f"当前版本: {current}")
+    set_output("version", latest)
 
-    if latest == current:
-        print("版本未变化，退出")
+    if latest == current_tag:
+        print("Version unchanged; exiting.")
+        set_output("updated", "false")
         return
 
     checksums = []
 
-    # Fixed Version
+    # Fixed Version (from edgeupdates artifacts)
     for arch in ARCHES:
-        url = (
-            "https://msedge.sf.dl.delivery.mp.microsoft.com/"
-            "filestreamingservice/files/"
-            f"WebView2.Fixed.{latest}.{arch}.cab"
-        )
-        path = f"dist/WebView2.Fixed.{latest}.{arch}.cab"
+        url = fixed_urls[arch]
+        filename = filename_from_url(url)
+        path = os.path.join("dist", filename)
         download(url, path)
         checksums.append((os.path.basename(path), sha256(path)))
 
-    # Evergreen MSI
-    for arch, url in EVERGREEN_MSI.items():
-        path = f"dist/WebView2.Evergreen.{arch}.msi"
+    # Evergreen Installer (from edgeupdates artifacts)
+    for arch in ARCHES:
+        url = evergreen_urls[arch]
+        filename = filename_from_url(url)
+        path = os.path.join("dist", filename)
         download(url, path)
         checksums.append((os.path.basename(path), sha256(path)))
 
-    with open("dist/SHA256SUMS.txt", "w") as f:
+    with open("dist/SHA256SUMS.txt", "w", encoding="utf-8") as f:
         for name, sumv in checksums:
             f.write(f"{sumv}  {name}\n")
 
-    with open("latest_version.txt", "w") as f:
-        f.write(latest)
+    set_output("updated", "true")
 
 
 if __name__ == "__main__":
