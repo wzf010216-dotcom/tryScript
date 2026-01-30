@@ -4,8 +4,17 @@ import urllib.parse
 import urllib.request
 import hashlib
 import subprocess
+import html as html_lib
 
-WEBVIEW2_DOWNLOAD_PAGE = "https://developer.microsoft.com/microsoft-edge/webview2"
+WEBVIEW2_DOWNLOAD_PAGES = [
+    "https://developer.microsoft.com/microsoft-edge/webview2",
+    "https://developer.microsoft.com/en-us/microsoft-edge/webview2",
+]
+WEBVIEW2_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/120.0.0.0 Safari/537.36"
+)
 
 ARCHES = ["x86", "x64", "arm64"]
 
@@ -50,9 +59,21 @@ def get_latest_tag_version():
 
 
 def extract_fixed_urls(html):
+    normalized = html
+    normalized = normalized.replace("\\u002F", "/").replace("\\u003A", ":")
+    normalized = normalized.replace("\\u002f", "/").replace("\\u003a", ":")
+    normalized = normalized.replace("\\/", "/")
+    normalized = html_lib.unescape(normalized)
     fixed = {}
-    for match in re.findall(r"https?://[^\"'\\s<>]+", html):
+    urls = re.findall(r"https?://[^\"'\\s<>]+", normalized)
+    urls += re.findall(
+        r"//msedge\\.sf\\.dl\\.delivery\\.mp\\.microsoft\\.com/filestreamingservice/files/[^\"'\\s<>]+",
+        normalized,
+    )
+    for match in urls:
         url = match.rstrip("\\")
+        if url.startswith("//"):
+            url = "https:" + url
         filename = filename_from_url(url)
         fixed_match = FIXED_REGEX.search(filename)
         if not fixed_match:
@@ -65,10 +86,12 @@ def extract_fixed_urls(html):
 
 
 def get_latest_release_artifacts():
-    with urllib.request.urlopen(WEBVIEW2_DOWNLOAD_PAGE) as resp:
-        html = resp.read().decode("utf-8", errors="ignore")
-
-    fixed = extract_fixed_urls(html)
+    fixed = {}
+    for page in WEBVIEW2_DOWNLOAD_PAGES:
+        html = fetch_text(page)
+        fixed = extract_fixed_urls(html)
+        if fixed:
+            break
 
     if not fixed:
         raise RuntimeError("No fixed version artifacts found on WebView2 download page")
@@ -88,11 +111,11 @@ def get_latest_release_artifacts():
 
 def resolve_url(url):
     try:
-        req = urllib.request.Request(url, method="HEAD")
+        req = urllib.request.Request(url, method="HEAD", headers=default_headers())
         with urllib.request.urlopen(req) as resp:
             return resp.geturl(), resp.headers.get("Content-Disposition")
     except Exception:
-        req = urllib.request.Request(url, method="GET")
+        req = urllib.request.Request(url, method="GET", headers=default_headers())
         with urllib.request.urlopen(req) as resp:
             return resp.geturl(), resp.headers.get("Content-Disposition")
 
@@ -134,6 +157,54 @@ def filename_from_url(url):
     parsed = urllib.parse.urlparse(url)
     base = os.path.basename(parsed.path)
     return base or "download.bin"
+
+
+def default_headers():
+    return {
+        "User-Agent": WEBVIEW2_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "identity",
+    }
+
+
+def fetch_text(url):
+    req = urllib.request.Request(url, headers=default_headers())
+    with urllib.request.urlopen(req) as resp:
+        content = resp.read()
+        encoding = (resp.headers.get("Content-Encoding") or "").lower()
+        if encoding in ("gzip", "x-gzip"):
+            import gzip
+
+            content = gzip.decompress(content)
+        elif encoding == "deflate":
+            import zlib
+
+            content = zlib.decompress(content)
+        elif encoding == "br":
+            try:
+                import brotli  # type: ignore
+
+                content = brotli.decompress(content)
+            except Exception:
+                pass
+        if os.environ.get("WEBVIEW2_DEBUG"):
+            print(
+                "Fetched",
+                resp.geturl(),
+                "status",
+                getattr(resp, "status", "unknown"),
+                "bytes",
+                len(content),
+                "content-type",
+                resp.headers.get("Content-Type"),
+            )
+        text = content.decode("utf-8", errors="ignore")
+        if os.environ.get("WEBVIEW2_DUMP_HTML"):
+            os.makedirs("dist", exist_ok=True)
+            with open("dist/webview2.html", "w", encoding="utf-8") as f:
+                f.write(text)
+        return text
 
 
 def main():
